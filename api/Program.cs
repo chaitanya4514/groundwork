@@ -1,5 +1,12 @@
+using System.Xml.Linq;
+using System.Text.RegularExpressions;
+
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton<UscisUpdates>();
+builder.Services.AddSingleton<LcaSearch>();
 var app = builder.Build();
+app.MapGet("/api/lca-search", (string? employer, string? zip, string? job, LcaSearch data) => data.Search(employer, zip, job));
+app.MapGet("/api/uscis-updates", async (UscisUpdates updates) => Results.Ok(await updates.Get()));
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.MapPost("/api/compare", (Scenario input) => {
@@ -53,3 +60,67 @@ record Month(int Number, decimal Payment, decimal Interest, decimal Principal, d
 record Projection(bool PaidOff, string? Warning, List<Month> Schedule, decimal TotalInterest, decimal TotalPaid);
 
 record Offer(string Kind, decimal Amount, decimal Rate, decimal IntroRate, int IntroMonths, decimal FeePercent, decimal AnnualFee, decimal Payment, int Term);
+
+record UscisHeadline(string Title, string Url, string Date);
+record UscisFeed(UscisHeadline[] Items, DateTimeOffset? CheckedAt, bool Stale);
+sealed class UscisUpdates {
+    private readonly HttpClient client = new() { Timeout = TimeSpan.FromSeconds(12) };
+    private readonly SemaphoreSlim gate = new(1, 1);
+    private UscisFeed cache;
+    private DateTimeOffset nextCheck;
+    public UscisUpdates(IWebHostEnvironment env) {
+        var seed = Path.Combine(env.ContentRootPath, "uscis-alerts.xml");
+        cache = new(File.Exists(seed) ? Parse(File.ReadAllText(seed)) : [], null, true);
+    }
+    internal static UscisHeadline[] Parse(string xml) {
+        return XDocument.Parse(xml).Descendants("item").Where(i => Regex.IsMatch((string?)i.Element("title") ?? "", @"H-?1B|L-1|OPT|student|employment|visa|fee|court|rule|policy", RegexOptions.IgnoreCase))
+            .Select(i => new UscisHeadline((string?)i.Element("title") ?? "", (string?)i.Element("link") ?? "", (string?)i.Element("pubDate") ?? ""))
+            .Where(i => Uri.TryCreate(i.Url, UriKind.Absolute, out var u) && u.Scheme == "https" && u.Host == "www.uscis.gov")
+            .Take(6).ToArray();
+    }
+    public async Task<UscisFeed> Get() {
+        await gate.WaitAsync();
+        try {
+            if (DateTimeOffset.UtcNow < nextCheck) return cache;
+            try {
+                var xml = await client.GetStringAsync("https://www.uscis.gov/news/rss-feed/22984");
+                var items = Parse(xml);
+                if (items.Length == 0) throw new InvalidDataException("No relevant alerts in feed");
+                cache = new(items, DateTimeOffset.UtcNow, false);
+                nextCheck = DateTimeOffset.UtcNow.AddMinutes(30);
+            } catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Xml.XmlException or InvalidDataException) {
+                cache = cache with { Stale = true };
+                nextCheck = DateTimeOffset.UtcNow.AddMinutes(5);
+            }
+            return cache;
+        } finally { gate.Release(); }
+    }
+}
+
+sealed class LcaSearch {
+    private readonly Lazy<Dictionary<string,string>[]> rows;
+    public LcaSearch(IWebHostEnvironment env) {
+        rows = new(() => {
+            using var file=File.OpenRead(Path.Combine(env.ContentRootPath, "Data", "lca-2026-q3.ndjson.gz"));
+            using var gzip=new System.IO.Compression.GZipStream(file,System.IO.Compression.CompressionMode.Decompress);
+            using var reader=new StreamReader(gzip);
+            var result=new List<Dictionary<string,string>>();
+            while(reader.ReadLine() is string line) result.Add(System.Text.Json.JsonSerializer.Deserialize<Dictionary<string,string>>(line)!);
+            return result.ToArray();
+        });
+    }
+    public IResult Search(string? employer, string? zip, string? job) {
+        employer=employer?.Trim() ?? ""; zip=zip?.Trim() ?? ""; job=job?.Trim() ?? "";
+        if(employer.Length<2 || employer.Length>150 || (zip!="" && !Regex.IsMatch(zip,@"^\d{5}$")) || job.Length>100)
+            return Results.BadRequest(new {error="Enter an employer name or case number (2–150 characters), and an optional five-digit work ZIP."});
+        try {
+            var matches=rows.Value.Where(r => (r.GetValueOrDefault("employer", "").Contains(employer,StringComparison.OrdinalIgnoreCase) || r.GetValueOrDefault("caseNumber", "").Equals(employer,StringComparison.OrdinalIgnoreCase))
+                && (zip=="" || r.GetValueOrDefault("zip", "").Split('-')[0]==zip)
+                && (job=="" || r.GetValueOrDefault("job", "").Contains(job,StringComparison.OrdinalIgnoreCase) || r.GetValueOrDefault("soc", "").Contains(job,StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(r=>r.GetValueOrDefault("begin", "")).ToArray();
+            return Results.Ok(new {total=matches.Length,records=matches.Take(25),dataset="FY2026 Q3 · determinations Oct 1, 2025–Jun 30, 2026",source="https://www.dol.gov/agencies/eta/foreign-labor/performance",importedAt="2026-10-29",scope="H-1B main disclosure worksites only; additional worksites and earlier fiscal years are not included."});
+        } catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException) {
+            return Results.Json(new {error="Official filing data is unavailable. Try again later; no wage has been inferred."},statusCode:503);
+        }
+    }
+}
