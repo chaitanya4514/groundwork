@@ -1,4 +1,4 @@
-# Borrowing Lens
+# Groundwork
 .NET 10 API and Angular 21 credit-card cost explainer.
 
 ## Run

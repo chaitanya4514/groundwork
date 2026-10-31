@@ -9,3 +9,5 @@ Validation: production Angular build and existing calculator/API and LCA search 
 Limits: public filings are possible matches, never a confirmed personal LCA. Employer actual wage is unavailable. MyVisaJobs is an external search shortcut, without an API integration. Public hosting remains unresolved for the .NET backend; the preview is local.
 
 Resume only when requested. Next potential work: .NET-capable hosting and broader/newer official filing coverage.
+
+Saved project folder: `~/Developer/groundwork`. Repository: `https://github.com/ChaitanyaKurumella/groundwork`. Project name: Groundwork.
